@@ -93,6 +93,11 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
     docker-compose up -d
     ```
 
+### Zeabur / 云平台部署
+
+- 服务监听端口优先读取 `PORT`；若该变量是未展开的模板占位符（例如 `${WEB_PORT}`），会尝试读取 `WEB_PORT`，仍无效时回退到 `7861`，不会因端口变量异常而反复重启。
+- Zeabur 上请把服务的 HTTP 端口映射设为 `7861`，并将环境变量 `PORT` 显式设为 `7861`（或者直接删除 `PORT` 变量），避免模板占位符未展开导致启动失败。
+
 ## 核心功能
 
 ### 🔄 API 端点和格式支持

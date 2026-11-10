@@ -218,13 +218,61 @@ if os.path.isdir("docs"):
     app.mount("/docs", StaticFiles(directory="docs"), name="docs")
 
 
+def _env_int(name: str, default: int) -> int:
+    """读取整型环境变量；空值/非数字时回退默认值，避免容器启动崩溃。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(f"环境变量 {name}={raw!r} 不是有效整数，使用默认值 {default}")
+        return default
+
+
+def _resolve_port(default: int = 7861) -> int:
+    """解析监听端口。
+
+    Zeabur 等平台的服务变量里，PORT 可能被写成未展开的模板占位符
+    （例如 ``${WEB_PORT}``），直接 int() 会让容器启动即崩溃。
+    这里优先使用合法的 PORT；否则尝试平台提供的 WEB_PORT；
+    都不合法时回退到 7861（Dockerfile EXPOSE / 模板默认端口）。
+    """
+    raw_port = (os.environ.get("PORT") or "").strip()
+    if raw_port.isdigit():
+        return int(raw_port)
+
+    raw_web_port = (os.environ.get("WEB_PORT") or "").strip()
+    if raw_web_port.isdigit():
+        log.warning(f"PORT={raw_port!r} 无效，改用 WEB_PORT={raw_web_port}")
+        return int(raw_web_port)
+
+    if raw_port:
+        log.warning(f"PORT={raw_port!r} 不是有效端口，回退到 {default}")
+    return default
+
+
+def _resolve_host(default: str = "0.0.0.0") -> str:
+    """读取监听地址；未展开的模板占位符（如 ${WEB_HOST}）回退到默认值。"""
+    raw = (os.environ.get("HOST") or "").strip()
+    if not raw:
+        return default
+    if "$" in raw or "{" in raw or "}" in raw:
+        log.warning(f"HOST={raw!r} 不是有效地址，回退到 {default}")
+        return default
+    return raw
+
+
 def main():
     """主启动函数：uvicorn 直接运行 ASGI 应用"""
     import uvicorn
 
-    port = int(os.environ.get("PORT", 7861))
-    host = os.environ.get("HOST", "0.0.0.0")
-    workers = int(os.environ.get("WORKERS", 1))
+    port = _resolve_port(7861)
+    host = _resolve_host("0.0.0.0")
+    workers = _env_int("WORKERS", 1)
+    if workers < 1:
+        log.warning(f"WORKERS={workers} 无效，使用 1")
+        workers = 1
 
     log.info("=" * 60)
     log.info("启动 AGY2API")
