@@ -245,5 +245,11 @@ class CredFileBatchActionRequest(BaseModel):
     emails: List[str]
 
 
+class CredQuotaBatchRequest(BaseModel):
+    """批量查询凭证额度"""
+
+    emails: List[str]
+
+
 class ConfigSaveRequest(BaseModel):
     config: dict

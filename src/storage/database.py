@@ -10,6 +10,7 @@ import os
 import random
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
@@ -951,6 +952,63 @@ class Database:
                 {"model_name": m.model_name or "(unknown)", "count": m.count, "total_tokens": m.total_tokens}
                 for m in model_rows
             ],
+        }
+
+    async def usage_log_today_summary(self) -> Dict[str, Any]:
+        """按本地自然日统计调用次数（每天 0 点自动重置）。
+
+        返回::
+
+            {
+              "date": "YYYY-MM-DD",
+              "start_timestamp": float,
+              "total": int,
+              "by_model": {model: count},
+              "by_credential": {email: {model: count}},
+            }
+
+        模型名优先取 upstream_model_name（实际调用的模型），为空时回退 model_name。
+        """
+        now_local = datetime.now().astimezone()
+        day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_ts = day_start.timestamp()
+
+        model_expr = func.coalesce(
+            func.nullif(UsageLog.upstream_model_name, ""),
+            UsageLog.model_name,
+        )
+        stmt = (
+            select(
+                UsageLog.credential_email,
+                model_expr.label("model"),
+                func.count().label("count"),
+            )
+            .where(UsageLog.created_at >= start_ts)
+            .group_by(UsageLog.credential_email, model_expr)
+        )
+
+        async with self.session() as s:
+            rows = (await s.execute(stmt)).all()
+
+        by_model: Dict[str, int] = {}
+        by_credential: Dict[str, Dict[str, int]] = {}
+        total = 0
+
+        for email, model, count in rows:
+            count = int(count or 0)
+            model = model or "unknown"
+            total += count
+            by_model[model] = by_model.get(model, 0) + count
+            if email:
+                bucket = by_credential.setdefault(email, {})
+                bucket[model] = bucket.get(model, 0) + count
+
+        return {
+            "date": day_start.strftime("%Y-%m-%d"),
+            "start_timestamp": start_ts,
+            "total": total,
+            "by_model": by_model,
+            "by_credential": by_credential,
         }
 
     async def delete_usage_logs_before(self, before_timestamp: float) -> int:

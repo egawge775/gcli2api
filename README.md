@@ -131,6 +131,8 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 基于 React + Vite + Tailwind 编译的现代化前端界面：
 - Antigravity OAuth 认证流程（支持回调 URL 快捷方式）
 - 凭证文件上传（JSON/ZIP）、下载、详情查看
+- 凭证卡片内联展示实时额度（Gemini / Claude+GPT 的 5 小时与周限额、重置倒计时）
+- 今日各模型调用次数（按凭证展示，页面顶部汇总所有凭证；每天 0 点自动重置）
 - 凭证导出（规范 JSON：refresh_token/access_token/expiry/email/tier/project_id）
 - 系统配置管理（环境变量锁定提示、热更新）
 - 批量凭证操作和状态筛选、批量导入（缺失字段自动获取）

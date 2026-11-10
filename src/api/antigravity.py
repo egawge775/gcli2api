@@ -1100,6 +1100,8 @@ async def fetch_quota_info(access_token: str, project_id: str = "") -> Dict[str,
                     "resetTime": b.get("resetTime", ""),
                     "remainingFraction": b.get("remainingFraction", 0),
                     "description": b.get("description"),
+                    # disabled 时上游会用 remainingFraction=1 占位，必须保留标记避免误显示 100%
+                    "disabled": bool(b.get("disabled", False)),
                 })
             quota_groups.append({
                 "displayName": g.get("displayName", ""),
@@ -1111,6 +1113,8 @@ async def fetch_quota_info(access_token: str, project_id: str = "") -> Dict[str,
         min_reset_days = None
         for group in quota_groups:
             for bucket in group.get("buckets", []):
+                if bucket.get("disabled"):
+                    continue
                 reset_time = bucket.get("resetTime", "")
                 if reset_time:
                     try:
@@ -1159,6 +1163,7 @@ async def fetch_quota_info(access_token: str, project_id: str = "") -> Dict[str,
                     "resetDays": reset_days,
                     "window": window,
                     "group": group_name,
+                    "disabled": bucket.get("disabled", False),
                 }
 
         log.info(

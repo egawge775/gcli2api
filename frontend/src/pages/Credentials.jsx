@@ -14,10 +14,220 @@ import {
   Trash2,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
+
+// ==================== 今日调用 / 额度展示工具 ====================
+
+function formatModelFamily(modelName) {
+  const name = (modelName || "").toLowerCase();
+  if (!name) return "未知";
+  if (name.includes("argon")) return "Argon";
+  if (name.includes("image")) return "Image";
+  if (name.includes("flash")) return "Flash";
+  if (name.includes("claude")) {
+    if (name.includes("opus")) return "Claude Opus";
+    if (name.includes("sonnet")) return "Claude Sonnet";
+    return "Claude";
+  }
+  if (name.includes("gpt")) return "GPT";
+  if (name.includes("pro")) return "Pro";
+  return modelName;
+}
+
+function groupUsageByFamily(byModel) {
+  const groups = {};
+  Object.entries(byModel || {}).forEach(([model, count]) => {
+    const label = formatModelFamily(model);
+    if (!groups[label]) groups[label] = { count: 0, models: {} };
+    groups[label].count += count;
+    groups[label].models[model] = (groups[label].models[model] || 0) + count;
+  });
+  return Object.entries(groups)
+    .map(([label, info]) => ({ label, ...info }))
+    .sort((a, b) => b.count - a.count);
+}
+
+function usageTitle(info) {
+  return Object.entries(info?.models || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([model, count]) => `${model}: ${count}`)
+    .join("\n");
+}
+
+function quotaPercent(bucket) {
+  const value = Number(bucket?.remainingFraction ?? 0) * 100;
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function quotaColor(remaining) {
+  if (remaining >= 80) return { bar: "bg-green-500", text: "text-green-400" };
+  if (remaining >= 40) return { bar: "bg-yellow-500", text: "text-yellow-400" };
+  if (remaining >= 20) return { bar: "bg-orange-500", text: "text-orange-400" };
+  return { bar: "bg-red-500", text: "text-red-400" };
+}
+
+function bucketLabel(bucket) {
+  const window = (bucket?.window || "").toLowerCase();
+  const id = (bucket?.bucketId || "").toLowerCase();
+  if (window === "weekly" || id.endsWith("weekly")) return "周限额";
+  if (window === "5h" || id.endsWith("5h")) return "5 小时限额";
+  return bucket?.displayName || window || "限额";
+}
+
+function quotaGroupLabel(group) {
+  const name = (group?.displayName || "").toLowerCase();
+  const ids = (group?.buckets || []).map((b) => (b?.bucketId || "").toLowerCase());
+  if (name.includes("claude") || name.includes("gpt") || ids.some((id) => id.startsWith("3p"))) {
+    return "Claude / GPT 模型";
+  }
+  if (name.includes("gemini") || ids.some((id) => id.startsWith("gemini"))) {
+    return "Gemini 模型";
+  }
+  return group?.displayName || "模型";
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "即将刷新";
+  const total = Math.floor(seconds);
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (days > 0) return `${days} 天 ${hours} 小时 后刷新`;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分钟 后刷新`;
+  if (minutes > 0) return `${minutes} 分钟 后刷新`;
+  return `${total} 秒 后刷新`;
+}
+
+function resetCountdown(resetTime, now) {
+  if (!resetTime) return "";
+  const ts = new Date(resetTime).getTime();
+  if (!Number.isFinite(ts)) return "";
+  return formatDuration(ts / 1000 - now);
+}
+
+function UsageBadges({ usage, limit = 4 }) {
+  const groups = groupUsageByFamily(usage);
+  if (!groups.length) {
+    return <span className="text-[11px] text-gray-600">0</span>;
+  }
+  const shown = groups.slice(0, limit);
+  return (
+    <>
+      {shown.map((group) => (
+        <span
+          key={group.label}
+          className="text-[11px] px-1.5 py-0.5 rounded bg-dark-700/80 border border-dark-600 text-gray-300"
+          title={usageTitle(group)}
+        >
+          {group.label} <span className="text-purple-300 font-medium">{group.count}</span>
+        </span>
+      ))}
+      {groups.length > limit && (
+        <span className="text-[11px] text-gray-500">+{groups.length - limit}</span>
+      )}
+    </>
+  );
+}
+
+function QuotaBucketRow({ bucket, now }) {
+  const disabled = !!bucket?.disabled;
+  const remaining = disabled ? 0 : quotaPercent(bucket);
+  const color = quotaColor(remaining);
+  const countdown = resetCountdown(bucket?.resetTime, now);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2 text-[11px] leading-4">
+        <span className="text-gray-500 truncate">
+          {bucketLabel(bucket)}
+          {countdown && <span className="text-gray-600"> · {countdown}</span>}
+        </span>
+        <span className={`font-medium flex-shrink-0 ${disabled ? "text-gray-500" : color.text}`}>
+          {disabled ? "不可用" : `剩余 ${remaining.toFixed(remaining < 10 ? 1 : 0)}%`}
+        </span>
+      </div>
+      <div className="mt-0.5 h-1.5 rounded-full bg-dark-600 overflow-hidden">
+        <div
+          className={`h-full rounded-full ${disabled ? "bg-gray-600" : color.bar}`}
+          style={{
+            width: `${disabled ? 100 : Math.max(remaining, 1)}%`,
+            opacity: disabled ? 0.35 : 1,
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function QuotaGroupBlock({ group, now }) {
+  const description = group?.description || "";
+  return (
+    <div className="rounded-lg bg-dark-800/60 border border-dark-700/60 px-2 py-1.5 space-y-1.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[11px] font-medium text-gray-300">{quotaGroupLabel(group)}</span>
+        {description && (
+          <span className="text-[10px] text-gray-600 truncate max-w-[60%]" title={description}>
+            {description}
+          </span>
+        )}
+      </div>
+      {(group?.buckets || []).map((bucket, index) => (
+        <QuotaBucketRow key={bucket.bucketId || bucket.window || index} bucket={bucket} now={now} />
+      ))}
+    </div>
+  );
+}
+
+function QuotaInline({ quota, loading, now, onRefresh, tierText }) {
+  const groups = quota?.quotaGroups || [];
+  const hasData = !!quota?.success && groups.length > 0;
+
+  return (
+    <div className="pt-2 border-t border-dark-700 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] text-gray-500">
+          套餐 <span className="text-purple-300">{tierText}</span>
+        </span>
+        <button
+          onClick={onRefresh}
+          disabled={loading}
+          className="text-[10px] text-gray-500 hover:text-white flex items-center gap-1 disabled:opacity-50"
+          title="刷新额度"
+        >
+          <RefreshCw size={10} className={loading ? "animate-spin" : ""} />
+          刷新额度
+        </button>
+      </div>
+
+      {!hasData && (loading || !quota) ? (
+        <div className="flex items-center gap-1.5 text-[11px] text-gray-500 py-1">
+          <Loader2 size={12} className="animate-spin" /> 额度加载中...
+        </div>
+      ) : quota?.error ? (
+        <div className="flex items-center justify-between gap-2 text-[11px] text-red-400">
+          <span className="truncate" title={quota.error}>额度获取失败</span>
+          <button onClick={onRefresh} className="text-gray-500 hover:text-white flex-shrink-0">
+            重试
+          </button>
+        </div>
+      ) : hasData ? (
+        <div className="space-y-1.5">
+          {groups.map((group, index) => (
+            <QuotaGroupBlock key={group.displayName || index} group={group} now={now} />
+          ))}
+        </div>
+      ) : (
+        <div className="text-[11px] text-gray-600 py-1">暂无额度数据</div>
+      )}
+    </div>
+  );
+}
+
+// ==================== 凭证页 ====================
 
 export default function Credentials() {
   const [items, setItems] = useState([]);
@@ -35,9 +245,14 @@ export default function Credentials() {
   const [errorModal, setErrorModal] = useState(null);
   const [busyFiles, setBusyFiles] = useState(new Set());
   const [now, setNow] = useState(Date.now() / 1000);
-  // 额度预览相关状态
+  // 额度相关状态：缓存完整额度响应（含 quotaGroups），供卡片内联与弹窗共用
   const [quotaModal, setQuotaModal] = useState(null); // { email } 额度弹窗
-  const [quotaCache, setQuotaCache] = useState({}); // 缓存额度数据 { email: { claude, gemini } | { error } }
+  const [quotaCache, setQuotaCache] = useState({}); // { email: { success, quotaGroups, ... } | { error } }
+  const [quotaLoading, setQuotaLoading] = useState(new Set()); // 正在拉取额度的 email
+  const [usageToday, setUsageToday] = useState({ date: "", total: 0, by_model: {} });
+  const [showUsageDetail, setShowUsageDetail] = useState(false);
+  const quotaCacheRef = useRef({});
+  const quotaLoadingRef = useRef(new Set());
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now() / 1000), 1000);
@@ -61,6 +276,7 @@ export default function Credentials() {
       setItems(res.data.items);
       setTotal(res.data.total);
       setStats(res.data.stats || { total: 0, normal: 0, disabled: 0 });
+      setUsageToday(res.data.usage_today || { date: "", total: 0, by_model: {} });
       setSelected(new Set());
     } catch (err) {
       showMessage("error", err.response?.data?.detail || "加载凭证失败");
@@ -76,6 +292,98 @@ export default function Credentials() {
   const showMessage = useCallback((type, text, title) => {
     setMessage({ type, text, title: title || (type === "success" ? "操作成功" : type === "error" ? "操作失败" : "提示") });
   }, []);
+
+  // 批量拉取当前页凭证的实时额度（分块，避免一次请求过多）
+  const ensureQuotas = useCallback(async (emails, force = false) => {
+    const targets = Array.from(new Set(emails)).filter(
+      (email) =>
+        email &&
+        (force || !quotaCacheRef.current[email]) &&
+        !quotaLoadingRef.current.has(email)
+    );
+    if (!targets.length) return;
+
+    targets.forEach((email) => quotaLoadingRef.current.add(email));
+    setQuotaLoading(new Set(quotaLoadingRef.current));
+
+    const chunkSize = 10;
+    for (let i = 0; i < targets.length; i += chunkSize) {
+      const chunk = targets.slice(i, i + chunkSize);
+      try {
+        const res = await api.post(
+          "/creds/quotas",
+          { emails: chunk },
+          { timeout: 180000 }
+        );
+        const results = res.data?.items || {};
+        setQuotaCache((prev) => {
+          const next = { ...prev };
+          chunk.forEach((email) => {
+            const item = results[email];
+            next[email] = item?.success
+              ? item
+              : { success: false, error: item?.error || "获取额度失败" };
+          });
+          quotaCacheRef.current = next;
+          return next;
+        });
+      } catch (err) {
+        const message =
+          err.response?.data?.detail || err.response?.data?.error || "获取额度失败";
+        setQuotaCache((prev) => {
+          const next = { ...prev };
+          chunk.forEach((email) => {
+            next[email] = { success: false, error: message };
+          });
+          quotaCacheRef.current = next;
+          return next;
+        });
+      } finally {
+        chunk.forEach((email) => quotaLoadingRef.current.delete(email));
+        setQuotaLoading(new Set(quotaLoadingRef.current));
+      }
+    }
+  }, []);
+
+  // 单个凭证额度刷新（卡片按钮 / 弹窗使用）
+  const refreshQuota = useCallback(async (email) => {
+    if (!email || quotaLoadingRef.current.has(email)) return;
+    quotaLoadingRef.current.add(email);
+    setQuotaLoading(new Set(quotaLoadingRef.current));
+    try {
+      const res = await api.get(`/creds/quota/${encodeURIComponent(email)}`);
+      const data = res.data?.success
+        ? res.data
+        : { success: false, error: res.data?.error || "获取额度失败" };
+      setQuotaCache((prev) => {
+        const next = { ...prev, [email]: data };
+        quotaCacheRef.current = next;
+        return next;
+      });
+    } catch (err) {
+      const message =
+        err.response?.data?.detail || err.response?.data?.error || "获取额度失败";
+      setQuotaCache((prev) => {
+        const next = { ...prev, [email]: { success: false, error: message } };
+        quotaCacheRef.current = next;
+        return next;
+      });
+    } finally {
+      quotaLoadingRef.current.delete(email);
+      setQuotaLoading(new Set(quotaLoadingRef.current));
+    }
+  }, []);
+
+  // 当前页凭证变化时自动加载额度（已缓存的不会重复请求）
+  useEffect(() => {
+    if (!items.length) return;
+    ensureQuotas(items.map((item) => item.email));
+  }, [items, ensureQuotas]);
+
+  const refreshAllQuotas = () => {
+    if (!items.length) return;
+    ensureQuotas(items.map((item) => item.email), true);
+  };
 
   const setBusy = (email, busy) => {
     setBusyFiles((prev) => {
@@ -168,78 +476,10 @@ export default function Credentials() {
     }
   };
 
-  // 额度弹窗：打开并强制刷新（不使用旧缓存）
-  const openQuotaModal = async (email) => {
+  // 额度弹窗：先展示缓存，再后台刷新
+  const openQuotaModal = (email) => {
     setQuotaModal({ email });
-    setBusy(email, true);
-    try {
-      const res = await api.get(`/creds/quota/${encodeURIComponent(email)}`);
-      if (res.data.success) {
-        const aggregated = aggregateQuota(res.data.quotaGroups || []);
-        setQuotaCache((prev) => ({ ...prev, [email]: aggregated }));
-      } else {
-        setQuotaCache((prev) => ({ ...prev, [email]: { error: res.data.error || "获取额度失败" } }));
-      }
-    } catch (err) {
-      setQuotaCache((prev) => ({
-        ...prev,
-        [email]: { error: err.response?.data?.detail || err.response?.data?.error || "获取额度失败" },
-      }));
-    } finally {
-      setBusy(email, false);
-    }
-  };
-
-  // 聚合额度分组 -> Claude / Gemini 各自的剩余百分比（多组取平均，组内取 weekly/5h 较小值）
-  const aggregateQuota = (groups) => {
-    const result = {
-      claude: { remaining: 0, count: 0, resetTime: "" },
-      gemini: { remaining: 0, count: 0, resetTime: "" },
-    };
-
-    groups.forEach((group) => {
-      const name = (group.displayName || "").toLowerCase();
-      const target = name.includes("claude") ? result.claude : result.gemini;
-      target.count += 1;
-
-      // 每组取 weekly / 5h 中较小的 remainingFraction（短板效应）
-      let minPct = null;
-      let minResetTime = "";
-      (group.buckets || []).forEach((bucket) => {
-        const pct = (bucket.remainingFraction || 0) * 100;
-        if (minPct === null || pct < minPct) {
-          minPct = pct;
-          minResetTime = bucket.resetTime || "";
-        }
-      });
-
-      if (minPct !== null) {
-        target.remaining += Math.round(minPct * 10) / 10;
-        if (!target.resetTime && minResetTime) {
-          try {
-            target.resetTime = new Date(minResetTime).toLocaleString("zh-CN");
-          } catch {
-            target.resetTime = minResetTime;
-          }
-        }
-      }
-    });
-
-    // 多组时取平均值
-    if (result.claude.count > 1)
-      result.claude.remaining = Math.round(result.claude.remaining / result.claude.count);
-    if (result.gemini.count > 1)
-      result.gemini.remaining = Math.round(result.gemini.remaining / result.gemini.count);
-
-    return result;
-  };
-
-  // 额度进度条颜色
-  const getQuotaColor = (remaining) => {
-    if (remaining >= 80) return { bar: "bg-green-500", text: "text-green-400" };
-    if (remaining >= 40) return { bar: "bg-yellow-500", text: "text-yellow-400" };
-    if (remaining >= 20) return { bar: "bg-orange-500", text: "text-orange-400" };
-    return { bar: "bg-red-500", text: "text-red-400" };
+    refreshQuota(email);
   };
 
   const exportCredential = async (email) => {
@@ -372,6 +612,9 @@ export default function Credentials() {
       unknown: "未能识别订阅等级，可点击「检验」或「重检套餐」重新检测",
     }[tier] || "");
 
+  const groupedUsage = groupUsageByFamily(usageToday.by_model);
+  const exactUsage = Object.entries(usageToday.by_model || {}).sort((a, b) => b[1] - a[1]);
+
   return (
     <div className="space-y-4 sm:space-y-6">
       {/* 消息弹窗 */}
@@ -401,6 +644,67 @@ export default function Credentials() {
         </div>
       </div>
 
+      {/* 今日模型调用统计（所有凭证汇总，每天 0 点重置） */}
+      <div className="card p-3 sm:p-4 space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 text-sm text-gray-300">
+            <BarChart3 size={15} className="text-purple-400" />
+            今日模型调用
+            <span className="text-[11px] text-gray-500">
+              （所有凭证汇总 · 每天 0 点重置）
+            </span>
+          </div>
+          <div className="flex items-center gap-2 text-[11px] text-gray-500">
+            <span>
+              共 <span className="text-gray-200 font-semibold">{usageToday.total || 0}</span> 次
+            </span>
+            {exactUsage.length > 0 && (
+              <button
+                onClick={() => setShowUsageDetail((v) => !v)}
+                className="text-purple-400 hover:text-purple-300 flex items-center gap-0.5"
+              >
+                {showUsageDetail ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                明细
+              </button>
+            )}
+          </div>
+        </div>
+
+        {groupedUsage.length > 0 ? (
+          <>
+            <div className="flex flex-wrap gap-1.5">
+              {groupedUsage.map((group) => (
+                <span
+                  key={group.label}
+                  className="text-xs px-2 py-0.5 rounded-lg bg-dark-700 border border-dark-600 text-gray-300"
+                  title={usageTitle(group)}
+                >
+                  {group.label}{" "}
+                  <span className="text-purple-300 font-semibold">{group.count}</span>
+                </span>
+              ))}
+            </div>
+            {showUsageDetail && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-1.5 pt-1">
+                {exactUsage.map(([model, count]) => (
+                  <div
+                    key={model}
+                    className="flex items-center justify-between gap-2 text-[11px] bg-dark-800/60 border border-dark-700 rounded px-2 py-1"
+                  >
+                    <span className="text-gray-400 truncate" title={model}>
+                      {model}
+                    </span>
+                    <span className="text-gray-200 font-medium flex-shrink-0">{count}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="text-[11px] text-gray-600">今日暂无调用</div>
+        )}
+      </div>
+
       {/* 操作按钮 */}
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -410,6 +714,15 @@ export default function Credentials() {
         >
           <RefreshCw size={15} className={loading ? "animate-spin" : ""} />
           刷新状态
+        </button>
+        <button
+          onClick={refreshAllQuotas}
+          disabled={!items.length || quotaLoading.size > 0}
+          className="btn btn-secondary text-xs sm:text-sm px-3 py-1.5 sm:px-4 sm:py-2 flex items-center gap-1.5 disabled:opacity-50"
+          title="刷新当前页所有凭证的额度"
+        >
+          <RefreshCw size={15} className={quotaLoading.size > 0 ? "animate-spin" : ""} />
+          刷新额度
         </button>
         <button
           onClick={recheckAllTiers}
@@ -627,7 +940,22 @@ export default function Credentials() {
                       {formatTime(cred.last_success)}
                     </span>
                   </div>
+                  <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                    <span className="text-[11px] text-gray-500 flex items-center gap-1 flex-shrink-0">
+                      <BarChart3 size={11} /> 今日调用
+                    </span>
+                    <UsageBadges usage={cred.usage_today} />
+                  </div>
                 </div>
+
+                {/* 实时额度（无需点击按钮，进入页面自动加载） */}
+                <QuotaInline
+                  quota={quotaCache[cred.email]}
+                  loading={quotaLoading.has(cred.email)}
+                  now={now}
+                  onRefresh={() => refreshQuota(cred.email)}
+                  tierText={tierLabel(cred.tier)}
+                />
 
                 {/* 操作按钮（2×3 网格铺满卡片） */}
                 <div className="grid grid-cols-3 gap-1.5 pt-1 border-t border-dark-700">
@@ -731,71 +1059,15 @@ export default function Credentials() {
           title={`额度信息 - ${quotaModal.email}`}
           onClose={() => setQuotaModal(null)}
         >
-          {busyFiles.has(quotaModal.email) ? (
-            <div className="flex items-center justify-center py-6 text-gray-500">
-              <RefreshCw size={16} className="animate-spin mr-2" />
-              加载额度中...
-            </div>
-          ) : quotaCache[quotaModal.email]?.error ? (
-            <div className="text-center py-4 text-red-400">{quotaCache[quotaModal.email].error}</div>
-          ) : quotaCache[quotaModal.email] ? (
-            <div className="space-y-3">
-              {quotaCache[quotaModal.email].claude?.count > 0 && (
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="text-purple-400 text-sm">Claude</span>
-                    <span className={`text-sm font-medium ${getQuotaColor(quotaCache[quotaModal.email].claude.remaining).text}`}>
-                      {quotaCache[quotaModal.email].claude.remaining.toFixed(1)}%
-                    </span>
-                  </div>
-                  <div className="bg-dark-600 rounded-full h-2">
-                    <div
-                      className={`h-2 rounded-full ${getQuotaColor(quotaCache[quotaModal.email].claude.remaining).bar}`}
-                      style={{ width: `${Math.min(quotaCache[quotaModal.email].claude.remaining, 100)}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-              {quotaCache[quotaModal.email].gemini?.count > 0 && (
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="text-cyan-400 text-sm">Gemini</span>
-                    <span className={`text-sm font-medium ${getQuotaColor(quotaCache[quotaModal.email].gemini.remaining).text}`}>
-                      {quotaCache[quotaModal.email].gemini.remaining.toFixed(1)}%
-                    </span>
-                  </div>
-                  <div className="bg-dark-600 rounded-full h-2">
-                    <div
-                      className={`h-2 rounded-full ${getQuotaColor(quotaCache[quotaModal.email].gemini.remaining).bar}`}
-                      style={{ width: `${Math.min(quotaCache[quotaModal.email].gemini.remaining, 100)}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-              {!quotaCache[quotaModal.email].claude?.count &&
-                !quotaCache[quotaModal.email].gemini?.count && (
-                  <div className="text-center py-3 text-gray-500">暂无额度数据</div>
-                )}
-              {(quotaCache[quotaModal.email].claude?.resetTime ||
-                quotaCache[quotaModal.email].gemini?.resetTime) && (
-                <div className="text-xs text-gray-500 text-right pt-1">
-                  重置:{" "}
-                  {quotaCache[quotaModal.email].claude?.resetTime ||
-                    quotaCache[quotaModal.email].gemini?.resetTime}
-                </div>
-              )}
-              <button
-                onClick={() => openQuotaModal(quotaModal.email)}
-                disabled={busyFiles.has(quotaModal.email)}
-                className="w-full text-xs text-gray-400 hover:text-white py-2 rounded-lg bg-dark-700 hover:bg-dark-600 flex items-center justify-center gap-1.5 disabled:opacity-50"
-              >
-                <RefreshCw size={12} className={busyFiles.has(quotaModal.email) ? "animate-spin" : ""} />
-                刷新额度
-              </button>
-            </div>
-          ) : (
-            <div className="text-center py-4 text-gray-500">加载中...</div>
-          )}
+          <QuotaInline
+            quota={quotaCache[quotaModal.email]}
+            loading={quotaLoading.has(quotaModal.email)}
+            now={now}
+            onRefresh={() => refreshQuota(quotaModal.email)}
+            tierText={tierLabel(
+              items.find((item) => item.email === quotaModal.email)?.tier
+            )}
+          />
         </Modal>
       )}
 

@@ -22,9 +22,11 @@ from src.credential_manager import (
 )
 from src.models import (
     CredFileActionRequest,
-    CredFileBatchActionRequest
+    CredFileBatchActionRequest,
+    CredQuotaBatchRequest,
 )
 from src.storage.database import get_database
+from src.usage_log import flush_usage_logs
 from src.utils import (
     verify_panel_token,
     ANTIGRAVITY_USER_AGENT,
@@ -363,6 +365,24 @@ async def get_creds_status_common(
         tier_filter=tier_filter if tier_filter and tier_filter != "all" else None
     )
 
+    # 今日各凭证 / 各模型的调用次数（每天 0 点自动重置）
+    usage_today: Dict[str, Any] = {
+        "date": "",
+        "total": 0,
+        "by_model": {},
+        "by_credential": {},
+    }
+    try:
+        # 先落库批量写队列，保证刚发生的调用也能统计到
+        await flush_usage_logs()
+        usage_today = await database.usage_log_today_summary()
+    except Exception as e:
+        log.warning(f"统计今日模型调用次数失败: {e}")
+
+    by_credential = usage_today.get("by_credential", {})
+    for item in result["items"]:
+        item["usage_today"] = by_credential.get(item["email"], {})
+
     return JSONResponse(content={
         "items": result["items"],
         "total": result["total"],
@@ -370,6 +390,11 @@ async def get_creds_status_common(
         "limit": limit,
         "has_more": (offset + limit) < result["total"],
         "stats": result.get("stats", {"total": 0, "normal": 0, "disabled": 0}),
+        "usage_today": {
+            "date": usage_today.get("date", ""),
+            "total": usage_today.get("total", 0),
+            "by_model": usage_today.get("by_model", {}),
+        },
     })
 
 
@@ -845,6 +870,53 @@ async def get_credential_errors(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def fetch_credential_quota_payload(
+    email: str,
+    database,
+) -> Dict[str, Any]:
+    """获取单个凭证的实时额度（含 token 刷新），供单个/批量接口复用。
+
+    返回统一结构：成功时 success=True 并带 models/quotaGroups 等字段；
+    失败时 success=False + error。
+    """
+    credential_data = await database.get_credential(email)
+    if not credential_data:
+        return {"success": False, "email": email, "error": "凭证不存在"}
+
+    credentials = Credentials.from_dict(credential_data)
+
+    await credentials.refresh_if_needed()
+
+    updated_data = credentials.to_dict()
+    if updated_data != credential_data:
+        log.info(f"Token已自动刷新: {email}")
+        await database.store_credential(email, updated_data)
+        credential_data = updated_data
+
+    access_token = credential_data.get("access_token") or credential_data.get("token")
+    if not access_token:
+        return {"success": False, "email": email, "error": "凭证中没有访问令牌"}
+
+    quota_info = await fetch_quota_info(access_token, credential_data.get("project_id", ""))
+
+    if not quota_info.get("success"):
+        return {
+            "success": False,
+            "email": email,
+            "error": quota_info.get("error", "未知错误"),
+        }
+
+    result: Dict[str, Any] = {
+        "success": True,
+        "email": email,
+        "models": quota_info.get("models", {}),
+    }
+    for extra_key in ("minResetDays", "accountTier", "isPro", "quotaGroups", "source"):
+        if extra_key in quota_info:
+            result[extra_key] = quota_info[extra_key]
+    return result
+
+
 @router.get("/quota/{email}")
 async def get_credential_quota(
     email: str,
@@ -852,51 +924,66 @@ async def get_credential_quota(
     """获取凭证的额度信息"""
     try:
         database = await get_database()
+        result = await fetch_credential_quota_payload(email, database)
 
-        credential_data = await database.get_credential(email)
-        if not credential_data:
+        if result.get("success"):
+            return JSONResponse(content=result)
+
+        if result.get("error") == "凭证不存在":
             raise HTTPException(status_code=404, detail="凭证不存在")
 
-        creds = Credentials.from_dict(credential_data)
-
-        await creds.refresh_if_needed()
-
-        updated_data = creds.to_dict()
-        if updated_data != credential_data:
-            log.info(f"Token已自动刷新: {email}")
-            await database.store_credential(email, updated_data)
-            credential_data = updated_data
-
-        access_token = credential_data.get("access_token") or credential_data.get("token")
-        if not access_token:
-            raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
-
-        quota_info = await fetch_quota_info(access_token, credential_data.get("project_id", ""))
-
-        if quota_info.get("success"):
-            result = {
-                "success": True,
-                "email": email,
-                "models": quota_info.get("models", {})
-            }
-            for extra_key in ("minResetDays", "accountTier", "isPro", "quotaGroups", "source"):
-                if extra_key in quota_info:
-                    result[extra_key] = quota_info[extra_key]
-            return JSONResponse(content=result)
-        else:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "email": email,
-                    "error": quota_info.get("error", "未知错误")
-                }
-            )
+        return JSONResponse(status_code=400, content=result)
 
     except HTTPException:
         raise
     except Exception as e:
         log.error(f"获取凭证额度失败 {email}: {e}")
+        raise HTTPException(status_code=500, detail=f"获取额度失败: {str(e)}")
+
+
+@router.post("/quotas")
+async def get_credential_quotas_batch(
+    request: CredQuotaBatchRequest,
+    token: str = Depends(verify_panel_token)):
+    """批量获取多个凭证的实时额度（用于凭证卡片内联展示）"""
+    try:
+        emails: List[str] = []
+        for email in request.emails:
+            email = (email or "").strip()
+            if email and email not in emails:
+                emails.append(email)
+
+        if not emails:
+            return JSONResponse(content={"items": {}})
+        if len(emails) > 100:
+            raise HTTPException(status_code=400, detail="一次最多查询 100 个凭证的额度")
+
+        database = await get_database()
+        # 限制并发，避免同时刷新太多 token / 触发上游限流
+        semaphore = asyncio.Semaphore(4)
+
+        async def _worker(cred_email: str) -> Dict[str, Any]:
+            async with semaphore:
+                try:
+                    return await fetch_credential_quota_payload(cred_email, database)
+                except Exception as e:
+                    log.warning(f"批量获取额度失败 {cred_email}: {e}")
+                    return {
+                        "success": False,
+                        "email": cred_email,
+                        "error": str(e)[:200],
+                    }
+
+        results = await asyncio.gather(*(_worker(email) for email in emails))
+
+        return JSONResponse(content={
+            "items": {item["email"]: item for item in results}
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"批量获取凭证额度失败: {e}")
         raise HTTPException(status_code=500, detail=f"获取额度失败: {str(e)}")
 
 
