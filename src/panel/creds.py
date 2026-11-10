@@ -883,6 +883,23 @@ async def fetch_credential_quota_payload(
     if not credential_data:
         return {"success": False, "email": email, "error": "凭证不存在"}
 
+    # 已被 401/403（封禁、TOS 违规等）标记的凭证不再查询额度：
+    # 配额接口本身可能仍然返回 100%，会让封禁账号看起来像正常账号。
+    state = await database.get_credential_state(email)
+    error_codes = {str(code) for code in (state.get("error_codes") or [])}
+    if "403" in error_codes or "401" in error_codes:
+        is_forbidden = "403" in error_codes
+        return {
+            "success": False,
+            "email": email,
+            "error": (
+                "凭证已被封禁（403），无法获取额度"
+                if is_forbidden
+                else "凭证认证失败（401），无法获取额度"
+            ),
+            "banned": True,
+        }
+
     credentials = Credentials.from_dict(credential_data)
 
     await credentials.refresh_if_needed()

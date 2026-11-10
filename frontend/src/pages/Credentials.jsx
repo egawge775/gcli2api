@@ -84,6 +84,9 @@ function quotaGroupLabel(group) {
   if (name.includes("claude") || name.includes("gpt") || ids.some((id) => id.startsWith("3p"))) {
     return "Claude / GPT 模型";
   }
+  if (name.includes("argon") || ids.some((id) => id.includes("argon"))) {
+    return "Gemini Argon 模型";
+  }
   if (name.includes("gemini") || ids.some((id) => id.startsWith("gemini"))) {
     return "Gemini 模型";
   }
@@ -209,10 +212,14 @@ function QuotaInline({ quota, loading, now, onRefresh, tierText }) {
         </div>
       ) : quota?.error ? (
         <div className="flex items-center justify-between gap-2 text-[11px] text-red-400">
-          <span className="truncate" title={quota.error}>额度获取失败</span>
-          <button onClick={onRefresh} className="text-gray-500 hover:text-white flex-shrink-0">
-            重试
-          </button>
+          <span className="truncate" title={quota.error}>
+            {quota.error || "额度获取失败"}
+          </span>
+          {!quota.banned && (
+            <button onClick={onRefresh} className="text-gray-500 hover:text-white flex-shrink-0">
+              重试
+            </button>
+          )}
         </div>
       ) : hasData ? (
         <div className="space-y-1.5">
@@ -322,7 +329,11 @@ export default function Credentials() {
             const item = results[email];
             next[email] = item?.success
               ? item
-              : { success: false, error: item?.error || "获取额度失败" };
+              : {
+                  success: false,
+                  error: item?.error || "获取额度失败",
+                  banned: !!item?.banned,
+                };
           });
           quotaCacheRef.current = next;
           return next;
@@ -354,7 +365,11 @@ export default function Credentials() {
       const res = await api.get(`/creds/quota/${encodeURIComponent(email)}`);
       const data = res.data?.success
         ? res.data
-        : { success: false, error: res.data?.error || "获取额度失败" };
+        : {
+            success: false,
+            error: res.data?.error || "获取额度失败",
+            banned: !!res.data?.banned,
+          };
       setQuotaCache((prev) => {
         const next = { ...prev, [email]: data };
         quotaCacheRef.current = next;
@@ -872,8 +887,10 @@ export default function Credentials() {
             return (
               <div
                 key={cred.email}
-                className={`card p-3 sm:p-4 space-y-3 transition-colors ${
-                  cred.disabled ? "border-red-500/30" : ""
+                className={`card p-3 sm:p-4 space-y-3 transition-all ${
+                  cred.disabled
+                    ? "border-red-500/30 opacity-60 hover:opacity-95 bg-dark-900/40"
+                    : ""
                 }`}
               >
                 {/* 头部：选择框 + 邮箱 + 状态标签 */}
